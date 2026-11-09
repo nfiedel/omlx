@@ -501,6 +501,8 @@ class TestCacheSettings:
             "hot_cache_max_size": "0",
             "hot_cache_write_through": False,
             "hot_cache_eviction_policy": "lru",
+            "ssd_cache_write_policy": "all",
+            "ssd_cache_min_chain_tokens": 16384,
             "ane_compile_cache": False,
             "initial_cache_blocks": 256,
         }

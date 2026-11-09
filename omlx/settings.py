@@ -417,6 +417,10 @@ class CacheSettings:
     hot_cache_write_through: bool = False
     # See VALID_HOT_CACHE_EVICTION_POLICIES.
     hot_cache_eviction_policy: str = "lru"
+    # See VALID_SSD_CACHE_WRITE_POLICIES.
+    ssd_cache_write_policy: str = "all"
+    # Threshold for ssd_cache_write_policy "min_chain_tokens" (positive int).
+    ssd_cache_min_chain_tokens: int = 16384
     # Reuse Apple's AOT-compiled ANE programs across server restarts
     # (OMLX_QWEN35_ANE_COMPILE_CACHE=1). The native gate reads the env var
     # once, at the first ANE compile, so a change applies on restart.
@@ -545,6 +549,8 @@ class CacheSettings:
             "hot_cache_max_size": self.hot_cache_max_size,
             "hot_cache_write_through": self.hot_cache_write_through,
             "hot_cache_eviction_policy": self.hot_cache_eviction_policy,
+            "ssd_cache_write_policy": self.ssd_cache_write_policy,
+            "ssd_cache_min_chain_tokens": self.ssd_cache_min_chain_tokens,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
@@ -602,6 +608,10 @@ class CacheSettings:
             hot_cache_eviction_policy=str(
                 data.get("hot_cache_eviction_policy", "lru")
             ).strip().lower(),
+            ssd_cache_write_policy=str(
+                data.get("ssd_cache_write_policy", "all")
+            ).strip().lower(),
+            ssd_cache_min_chain_tokens=data.get("ssd_cache_min_chain_tokens", 16384),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
@@ -613,6 +623,16 @@ class CacheSettings:
 # block when nothing else can be evicted, so a cached chain is never broken in
 # the middle.
 VALID_HOT_CACHE_EVICTION_POLICIES: tuple[str, ...] = ("lru", "chain_aware_lru")
+
+# SSD cache write policies for dirty hot entries leaving the hot tier
+# (eviction, admission refusal, shrink, clear, shutdown flush).
+# "all" writes every one. "min_chain_tokens" writes a block only if its chain
+# (conversation) reached ssd_cache_min_chain_tokens, or a block built on it
+# was written (so every written run starts at the chain's first block);
+# shorter chains (sub-agents, side calls) stay in RAM and are dropped when
+# they leave it. Requires hot_cache_eviction_policy "chain_aware_lru"
+# (newest blocks leave RAM first).
+VALID_SSD_CACHE_WRITE_POLICIES: tuple[str, ...] = ("all", "min_chain_tokens")
 
 
 def is_valid_gdn_snapshot_interval(value: Any) -> bool:
@@ -1909,6 +1929,22 @@ class GlobalSettings:
         except ValueError as e:
             errors.append(f"Invalid gdn_staging_ram_budget: {e}")
 
+        if self.cache.ssd_cache_write_policy not in VALID_SSD_CACHE_WRITE_POLICIES:
+            errors.append(
+                "ssd_cache_write_policy must be one of: "
+                + ", ".join(VALID_SSD_CACHE_WRITE_POLICIES)
+            )
+        if not is_valid_gdn_snapshot_interval(self.cache.ssd_cache_min_chain_tokens):
+            errors.append("ssd_cache_min_chain_tokens must be a positive integer")
+        if (
+            self.cache.ssd_cache_write_policy == "min_chain_tokens"
+            and self.cache.hot_cache_eviction_policy != "chain_aware_lru"
+        ):
+            errors.append(
+                'ssd_cache_write_policy "min_chain_tokens" requires '
+                'hot_cache_eviction_policy "chain_aware_lru"'
+            )
+
         if self.cache.hot_cache_eviction_policy not in VALID_HOT_CACHE_EVICTION_POLICIES:
             errors.append(
                 "hot_cache_eviction_policy must be one of: "
@@ -2067,6 +2103,8 @@ class GlobalSettings:
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
             hot_cache_eviction_policy=self.cache.hot_cache_eviction_policy,
+            ssd_cache_write_policy=self.cache.ssd_cache_write_policy,
+            ssd_cache_min_chain_tokens=self.cache.ssd_cache_min_chain_tokens,
             gdn_snapshot_interval=self.cache.gdn_snapshot_interval,
             gdn_staging_ram_budget_bytes=staging_bytes,
             gdn_staging_ram_budget_fraction=staging_fraction,

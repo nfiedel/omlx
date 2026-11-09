@@ -1633,6 +1633,7 @@ class BlockAwarePrefixCache(CacheManager):
                         replace_existing=False,
                         parent_hash=parent_hash,
                         tail_terminal=is_tail_terminal,
+                        chain_end_tokens=global_end,
                     )
                     if saved:
                         if split_gdn_layout:
@@ -2366,6 +2367,9 @@ class BlockAwarePrefixCache(CacheManager):
             parent_hash, tail_terminal = (
                 lineage(block_hash) if callable(lineage) else (None, False)
             )
+            chain_end = getattr(self.paged_ssd_cache, "get_block_chain_end", lambda _h: 0)(
+                block_hash
+            )
             self.paged_ssd_cache.forget_block(block_hash)
             saved = self.paged_ssd_cache.save_block(
                 block_hash=block_hash,
@@ -2377,6 +2381,7 @@ class BlockAwarePrefixCache(CacheManager):
                 hot_cache_write_back=hot_cache_write_back,
                 parent_hash=parent_hash,
                 tail_terminal=tail_terminal,
+                chain_end_tokens=chain_end,
             )
             if saved:
                 logger.debug(
@@ -2558,6 +2563,9 @@ class BlockAwarePrefixCache(CacheManager):
             parent_hash, tail_terminal = (
                 lineage(block_hash) if callable(lineage) else (None, False)
             )
+            chain_end = getattr(self.paged_ssd_cache, "get_block_chain_end", lambda _h: 0)(
+                block_hash
+            )
             self.paged_ssd_cache.forget_block(block_hash)
             saved = self.paged_ssd_cache.save_block(
                 block_hash=block_hash,
@@ -2569,6 +2577,7 @@ class BlockAwarePrefixCache(CacheManager):
                 hot_cache_write_back=hot_cache_write_back,
                 parent_hash=parent_hash,
                 tail_terminal=tail_terminal,
+                chain_end_tokens=chain_end,
             )
             if not saved:
                 return False
@@ -3514,6 +3523,16 @@ class BlockAwarePrefixCache(CacheManager):
                         f"Failed to load block {block_id} from tiered cache, "
                         f"using {valid_block_count} valid blocks"
                     )
+                    # Report the matched tokens this miss loses, so the SSD
+                    # write policy can count regret for blocks it dropped.
+                    note_loss = getattr(self.paged_ssd_cache, "note_restore_loss", None)
+                    if callable(note_loss) and block.block_hash is not None:
+                        lost_tokens = sum(
+                            self.paged_cache.allocated_blocks[bid].token_count
+                            for bid in block_table.block_ids[idx:]
+                            if bid in self.paged_cache.allocated_blocks
+                        )
+                        note_loss(block.block_hash, lost_tokens)
                     # Remove failed block from hash cache to prevent future false hits
                     if block.block_hash is not None:
                         self.paged_cache.cached_block_hash_to_block.pop(

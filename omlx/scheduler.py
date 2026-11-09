@@ -1987,6 +1987,9 @@ class SchedulerConfig:
     hot_cache_write_through: bool = False
     # "lru" or "chain_aware_lru" (see settings.VALID_HOT_CACHE_EVICTION_POLICIES)
     hot_cache_eviction_policy: str = "lru"
+    # "all" | "min_chain_tokens" (see settings.VALID_SSD_CACHE_WRITE_POLICIES)
+    ssd_cache_write_policy: str = "all"
+    ssd_cache_min_chain_tokens: int = 16384
     # Real GDN state every N-th block (+ tips), embedded or sidecar layout;
     # see settings.CacheSettings.
     gdn_snapshot_interval: int = 1
@@ -11566,6 +11569,8 @@ class Scheduler:
                     hot_cache_only=self.config.hot_cache_only,
                     hot_cache_write_through=self.config.hot_cache_write_through,
                     hot_cache_eviction_policy=self.config.hot_cache_eviction_policy,
+                    ssd_cache_write_policy=self.config.ssd_cache_write_policy,
+                    ssd_cache_min_chain_tokens=self.config.ssd_cache_min_chain_tokens,
                     hot_cache_budget=self.config.hot_cache_budget,
                     expected_model_name=name,
                     expected_num_layers=len(draft_cache_list),
@@ -17031,6 +17036,8 @@ class Scheduler:
                 hot_cache_only=self.config.hot_cache_only,
                 hot_cache_write_through=self.config.hot_cache_write_through,
                 hot_cache_eviction_policy=self.config.hot_cache_eviction_policy,
+                ssd_cache_write_policy=self.config.ssd_cache_write_policy,
+                ssd_cache_min_chain_tokens=self.config.ssd_cache_min_chain_tokens,
                 hot_cache_budget=self.config.hot_cache_budget,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
                 expected_model_name=self.config.model_name or "",

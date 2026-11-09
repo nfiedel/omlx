@@ -753,6 +753,8 @@ class GlobalSettingsRequest(BaseModel):
     hot_cache_write_through: bool | None = None
     hot_cache_eviction_policy: str | None = None  # "lru" | "chain_aware_lru"
     gdn_snapshot_interval: int | None = None  # positive int; 1 = every block
+    ssd_cache_write_policy: str | None = None  # "all" | "min_chain_tokens"
+    ssd_cache_min_chain_tokens: int | None = None  # positive int
     ane_compile_cache: bool | None = None
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
@@ -1509,6 +1511,12 @@ async def _apply_cache_settings_runtime(
     )
     pool._scheduler_config.gdn_snapshot_interval = (
         global_settings.cache.gdn_snapshot_interval
+    )
+    pool._scheduler_config.ssd_cache_write_policy = (
+        global_settings.cache.ssd_cache_write_policy
+    )
+    pool._scheduler_config.ssd_cache_min_chain_tokens = (
+        global_settings.cache.ssd_cache_min_chain_tokens
     )
     pool._scheduler_config.gdn_ssd_split_enabled = (
         global_settings.cache.get_gdn_ssd_split_enabled()
@@ -4764,6 +4772,8 @@ def _global_settings_response(global_settings):
             "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
             "hot_cache_eviction_policy": global_settings.cache.hot_cache_eviction_policy,
             "gdn_snapshot_interval": global_settings.cache.gdn_snapshot_interval,
+            "ssd_cache_write_policy": global_settings.cache.ssd_cache_write_policy,
+            "ssd_cache_min_chain_tokens": global_settings.cache.ssd_cache_min_chain_tokens,
             "ane_compile_cache": global_settings.cache.ane_compile_cache,
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
@@ -5462,6 +5472,29 @@ async def update_global_settings(
             )
         if request.gdn_snapshot_interval != global_settings.cache.gdn_snapshot_interval:
             global_settings.cache.gdn_snapshot_interval = request.gdn_snapshot_interval
+            cache_changed = True
+    if request.ssd_cache_write_policy is not None:
+        from ..settings import VALID_SSD_CACHE_WRITE_POLICIES
+
+        write_policy = request.ssd_cache_write_policy.strip().lower()
+        if write_policy not in VALID_SSD_CACHE_WRITE_POLICIES:
+            raise HTTPException(
+                status_code=400,
+                detail="ssd_cache_write_policy must be one of: "
+                + ", ".join(VALID_SSD_CACHE_WRITE_POLICIES),
+            )
+        if write_policy != global_settings.cache.ssd_cache_write_policy:
+            global_settings.cache.ssd_cache_write_policy = write_policy
+            cache_changed = True
+    if request.ssd_cache_min_chain_tokens is not None:
+        from ..settings import is_valid_gdn_snapshot_interval
+
+        if not is_valid_gdn_snapshot_interval(request.ssd_cache_min_chain_tokens):
+            raise HTTPException(
+                status_code=400, detail="ssd_cache_min_chain_tokens must be a positive integer"
+            )
+        if request.ssd_cache_min_chain_tokens != global_settings.cache.ssd_cache_min_chain_tokens:
+            global_settings.cache.ssd_cache_min_chain_tokens = request.ssd_cache_min_chain_tokens
             cache_changed = True
     if requested_storage is not None:
         if requested_storage != global_settings.cache.get_gdn_snapshot_storage():

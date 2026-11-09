@@ -44,7 +44,10 @@ from .pooling_delta import (
     POOLING_CACHE_DELTA_CLASS,
     POOLING_CACHE_DELTA_FORMAT_VERSION,
 )
-from ..settings import VALID_HOT_CACHE_EVICTION_POLICIES
+from ..settings import (
+    VALID_HOT_CACHE_EVICTION_POLICIES,
+    VALID_SSD_CACHE_WRITE_POLICIES,
+)
 from .stats import PagedSSDCacheStats
 
 logger = logging.getLogger(__name__)
@@ -1168,6 +1171,9 @@ class PagedSSDBlockMetadata:
     # Chain parent and tail marker; a tail is found through its parent.
     parent_hash: bytes | None = None
     tail_terminal: bool = False
+    # Absolute token position where this block ends in its chain (0 = unknown).
+    # In-memory only; used by ssd_cache_write_policy "min_chain_tokens".
+    chain_end_tokens: int = 0
 
     def touch(self) -> None:
         """Update last access time."""
@@ -1837,6 +1843,8 @@ class PagedSSDCacheManager(CacheManager):
         hot_cache_write_through: bool = False,
         hot_cache_budget: SharedHotCacheBudget | None = None,
         hot_cache_eviction_policy: str = "lru",
+        ssd_cache_write_policy: str = "all",
+        ssd_cache_min_chain_tokens: int = 16384,
         expected_model_name: str = "",
         expected_num_layers: int = 0,
         expected_block_size: int = 0,
@@ -1859,6 +1867,11 @@ class PagedSSDCacheManager(CacheManager):
             hot_cache_only: When True, skip directory init and writer thread.
                 All data is stored exclusively in the hot cache (RAM only).
                 No SSD I/O is performed.
+            ssd_cache_write_policy: "all" (default) writes every dirty hot
+                entry that leaves the hot tier. "min_chain_tokens" writes a
+                block only if its chain reached ssd_cache_min_chain_tokens or
+                a block built on it was written (requires chain_aware_lru).
+                Write-through mode is unaffected.
             hot_cache_eviction_policy: "lru" (default) or "chain_aware_lru".
                 The latter only evicts hot entries no other hot entry builds
                 on, orphans first, and refuses to admit a block rather than
@@ -1986,7 +1999,30 @@ class PagedSSDCacheManager(CacheManager):
             "preload_time_ms": 0.0,
             "ssd_write_drops": 0,
             "ssd_inline_write_fallbacks": 0,
+            # SSD write accounting (see ssd_cache_write_policy).
+            "ssd_writes_skipped_orphan": 0,
+            "ssd_writes_skipped_orphan_bytes": 0,
+            "ssd_write_regret": 0,
+            "ssd_write_regret_tokens": 0,
+            "gdn_sidecars_dropped": 0,
         }
+        policy = str(ssd_cache_write_policy).strip().lower()
+        if policy not in VALID_SSD_CACHE_WRITE_POLICIES:
+            raise ValueError(
+                "ssd_cache_write_policy must be one of: "
+                f"{', '.join(VALID_SSD_CACHE_WRITE_POLICIES)} (got {ssd_cache_write_policy!r})"
+            )
+        self._ssd_write_policy = policy
+        if type(ssd_cache_min_chain_tokens) is not int or ssd_cache_min_chain_tokens < 1:
+            raise ValueError("ssd_cache_min_chain_tokens must be a positive integer")
+        self._ssd_min_chain_tokens = ssd_cache_min_chain_tokens
+        self._ssd_min_chain_fallback_warned = False
+        # Recently dropped (not written) block hashes -> token_count, to count
+        # later lookups that wanted them ("regret"). Bounded, oldest first out.
+        self._ssd_drop_ghosts: OrderedDict[bytes, int] = OrderedDict()
+        # Hashes of the entries a bulk flush (clear / shutdown) is processing;
+        # a parent in this set still counts as reachable.
+        self._flush_set: set[bytes] = set()
 
         # --- Hot cache (in-memory raw-bytes tier) ---
         self._hot_cache_budget = hot_cache_budget
@@ -2127,6 +2163,12 @@ class PagedSSDCacheManager(CacheManager):
             bool(getattr(meta, "tail_terminal", False)),
         )
 
+    def get_block_chain_end(self, block_hash: bytes) -> int:
+        """Recorded chain end position of a hot or SSD-indexed block (0 = unknown)."""
+        entry = self._hot_cache.get(block_hash)
+        meta = entry.get("block_metadata") if entry is not None else self._index.get(block_hash)
+        return int(getattr(meta, "chain_end_tokens", 0) or 0)
+
     # --- chain-aware eviction support -------------------------------------
 
     @staticmethod
@@ -2207,6 +2249,167 @@ class PagedSSDCacheManager(CacheManager):
                 first_leaf = block_hash
         return first_leaf
 
+    # --- SSD write policy ---------------------------------------------------
+
+    _SSD_DROP_GHOSTS_MAX = 10_000
+    _SSD_DROP_DECISIONS = frozenset({"orphan", "short"})
+
+    def _ssd_write_decision(self, block_hash: bytes, entry: dict) -> str:
+        """Why a dirty entry leaving the hot tier is or is not written.
+
+        Returns "all", "write_through", "long" or "closure" (write), or
+        "orphan" or "short" (drop). Under "min_chain_tokens" a block is
+        written if its chain reached the threshold, or a block built on it
+        was written; chain_aware_lru evicts children first, so the written
+        set stays prefix-closed. Orphans (parent neither in RAM, in the flush
+        being processed, nor on SSD) are unreachable and dropped.
+        """
+        if self._ssd_write_policy == "all":
+            return "all"
+        if self._hot_cache_write_through:
+            return "write_through"
+        if not self._min_chain_supported():
+            return "all"
+        parent = self._hot_entry_parent(entry)
+        if (
+            parent is not None
+            and parent not in self._hot_cache
+            and parent not in self._flush_set
+            and not self._index.contains(parent)
+        ):
+            return "orphan"
+        meta = entry.get("block_metadata")
+        if int(getattr(meta, "chain_end_tokens", 0) or 0) >= self._ssd_min_chain_tokens:
+            return "long"
+        if entry.get("persist_child"):
+            return "closure"
+        return "short"
+
+    def _min_chain_supported(self) -> bool:
+        """min_chain_tokens relies on chain_aware_lru's newest-first eviction.
+
+        Under plain LRU a chain's first blocks can leave RAM before the chain
+        is known to be long, which would leave unreachable blocks on SSD, so
+        the policy falls back to "all" (with a one-time warning).
+        """
+        policy = (
+            self._hot_cache_budget.eviction_policy
+            if self._hot_cache_budget is not None
+            else self._hot_eviction_policy
+        )
+        if policy == "chain_aware_lru":
+            return True
+        if not self._ssd_min_chain_fallback_warned:
+            logger.warning(
+                'ssd_cache_write_policy "min_chain_tokens" requires '
+                'chain_aware_lru eviction; writing all blocks instead'
+            )
+            self._ssd_min_chain_fallback_warned = True
+        return False
+
+    def _mark_parent_persist(self, entry: dict) -> None:
+        """A written block needs its parent written too (keeps runs complete)."""
+        parent = self._hot_entry_parent(entry)
+        if parent is None:
+            return
+        parent_entry = self._hot_cache.get(parent)
+        if parent_entry is not None:
+            parent_entry["persist_child"] = True
+
+    def _flush_persist_closure(self, entries: list[tuple[bytes, dict]]) -> None:
+        self._flush_set = {h for h, _e in entries}
+        self._flush_persist_closure_marks(entries)
+
+    def _flush_persist_closure_marks(self, entries: list[tuple[bytes, dict]]) -> None:
+        """Before a bulk flush, mark every ancestor of a long block for writing.
+
+        A bulk flush does not run newest-first, so a parent could otherwise be
+        judged before its long child had marked it.
+        """
+        if self._ssd_write_policy != "min_chain_tokens":
+            return
+        by_hash = dict(entries)
+        for _block_hash, entry in entries:
+            meta = entry.get("block_metadata")
+            if int(getattr(meta, "chain_end_tokens", 0) or 0) < self._ssd_min_chain_tokens:
+                continue
+            parent = self._hot_entry_parent(entry)
+            seen = 0
+            while parent is not None and parent in by_hash and seen < len(by_hash):
+                parent_entry = by_hash[parent]
+                if parent_entry.get("persist_child"):
+                    break
+                parent_entry["persist_child"] = True
+                parent = self._hot_entry_parent(parent_entry)
+                seen += 1
+
+    def _persist_or_drop(self, block_hash: bytes, entry: dict, *, blocking: bool = False) -> bool:
+        """Write a dirty entry leaving the hot tier, or drop it per policy.
+
+        Returns True if the entry was queued/written.
+        """
+        if self._hot_cache_only:
+            return False
+        decision = self._ssd_write_decision(block_hash, entry)
+        if decision in self._SSD_DROP_DECISIONS:
+            size = self._hot_cache_entry_size(entry)
+            self._stats[f"ssd_writes_skipped_{decision}"] = (
+                self._stats.get(f"ssd_writes_skipped_{decision}", 0) + 1
+            )
+            self._stats[f"ssd_writes_skipped_{decision}_bytes"] = (
+                self._stats.get(f"ssd_writes_skipped_{decision}_bytes", 0) + size
+            )
+            self._remember_dropped(block_hash, entry)
+            self._drop_gdn_sidecar(block_hash, entry)
+            return False
+        written = self._enqueue_ssd_write(block_hash, entry, blocking=blocking)
+        if written and self._ssd_write_policy == "min_chain_tokens":
+            self._mark_parent_persist(entry)
+        return written
+
+    def _remember_dropped(self, block_hash: bytes, entry: dict) -> None:
+        meta = entry.get("block_metadata")
+        tokens = int(getattr(meta, "token_count", 0) or 0)
+        with self._hot_cache_lock:
+            self._ssd_drop_ghosts[block_hash] = tokens
+            self._ssd_drop_ghosts.move_to_end(block_hash)
+            while len(self._ssd_drop_ghosts) > self._SSD_DROP_GHOSTS_MAX:
+                self._ssd_drop_ghosts.popitem(last=False)
+
+    def note_restore_loss(self, block_hash: bytes, lost_tokens: int) -> None:
+        """A restore stopped at ``block_hash``; count the matched tokens it lost
+        if the block was dropped by the SSD write policy."""
+        with self._hot_cache_lock:
+            dropped = self._ssd_drop_ghosts.pop(block_hash, None)
+        if dropped is not None:
+            self._stats["ssd_write_regret"] += 1
+            self._stats["ssd_write_regret_tokens"] += int(lost_tokens)
+
+    def _drop_gdn_sidecar(self, block_hash: bytes, entry: dict) -> None:
+        """Delete a dropped block's split-layout GDN sidecar (unusable without KV)."""
+        if self._hot_cache_only or self._cache_dir is None:
+            return
+        meta = entry.get("block_metadata")
+        signature = getattr(meta, "cache_signature", None)
+        if not isinstance(signature, str):
+            return
+        try:
+            gdn_signature = self.gdn_cache_signature_for(
+                model_name=getattr(meta, "model_name", "") or "",
+                num_layers=int(getattr(meta, "num_layers", 0) or 0),
+                block_size=int(getattr(meta, "block_size", 0) or 0),
+                layer_cache_types=list(getattr(meta, "layer_cache_types", None) or []),
+            )
+        except Exception:
+            gdn_signature = signature
+        for candidate in {gdn_signature, signature}:
+            try:
+                if self.forget_gdn_checkpoint(block_hash, candidate):
+                    self._stats["gdn_sidecars_dropped"] += 1
+                    return
+            except Exception as e:  # best effort cleanup
+                logger.debug("GDN sidecar drop failed for %s: %s", block_hash.hex()[:16], e)
+
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
         if entry.get("staging"):
@@ -2217,7 +2420,9 @@ class PagedSSDCacheManager(CacheManager):
                 block_hash.hex()[:16],
             )
             return
-        self._enqueue_ssd_write(block_hash, entry)
+        if self._hot_cache_only:
+            return  # Nothing is written to SSD in hot-cache-only mode.
+        self._persist_or_drop(block_hash, entry)
 
     def _hot_cache_put(self, block_hash: bytes, entry: dict) -> None:
         """Add entry to hot cache, evicting LRU entries if capacity exceeded.
@@ -3647,6 +3852,7 @@ class PagedSSDCacheManager(CacheManager):
         replace_existing: bool = False,
         parent_hash: bytes | None = None,
         tail_terminal: bool = False,
+        chain_end_tokens: int = 0,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -3674,6 +3880,8 @@ class PagedSSDCacheManager(CacheManager):
                 snapshot; normal deduplicated saves must leave it False.
             parent_hash: Chain hash of the preceding block, if any.
             tail_terminal: True for a short terminal block, re-indexed by parent.
+            chain_end_tokens: Absolute token position where the block ends in
+                its chain (for ssd_cache_write_policy "min_chain_tokens").
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -4048,6 +4256,7 @@ class PagedSSDCacheManager(CacheManager):
                 layer_meta_states=layer_meta_states,
                 parent_hash=parent_hash,
                 tail_terminal=tail_terminal,
+                chain_end_tokens=int(chain_end_tokens or 0),
             )
 
             # Store in hot cache (or temporary buffer) for immediate read-back.
@@ -5423,6 +5632,7 @@ class PagedSSDCacheManager(CacheManager):
             self._hot_cache_total_bytes = 0
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
+        self._flush_persist_closure(entries)
         flushed = 0
         for i, (block_hash, entry) in enumerate(entries):
             if self._writer_thread and not self._writer_thread.is_alive():
@@ -5434,10 +5644,11 @@ class PagedSSDCacheManager(CacheManager):
                     f"{len(entries) - i} remaining entries unflushed"
                 )
                 break
-            if entry.get("dirty", True) and self._enqueue_ssd_write(
+            if entry.get("dirty", True) and self._persist_or_drop(
                 block_hash, entry
             ):
                 flushed += 1
+        self._flush_set = set()
         if entries:
             logger.info(
                 "Cleared %d hot cache entries (%d flushed to SSD first)",
@@ -5724,6 +5935,7 @@ class PagedSSDCacheManager(CacheManager):
         if self._hot_cache_enabled:
             with self._hot_cache_lock:
                 entries_to_flush = list(self._hot_cache.items())
+            self._flush_persist_closure(entries_to_flush)
             flushed = 0
             failed = 0
             for block_hash, entry in entries_to_flush:
@@ -5738,10 +5950,15 @@ class PagedSSDCacheManager(CacheManager):
                     continue
                 # A file at the same hash may contain an older, incompatible
                 # payload. Only the dirty flag proves this entry is persisted.
+                decision = self._ssd_write_decision(block_hash, entry)
+                if decision in self._SSD_DROP_DECISIONS and not self._hot_cache_only:
+                    self._persist_or_drop(block_hash, entry)
+                    continue
                 if self._enqueue_ssd_write(block_hash, entry, blocking=True):
                     flushed += 1
                 else:
                     failed += 1
+            self._flush_set = set()
             if flushed:
                 logger.info(f"Flushed {flushed} hot cache blocks to SSD")
             if failed:
