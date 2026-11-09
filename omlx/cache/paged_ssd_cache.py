@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import stat
 import struct
@@ -2000,10 +2001,15 @@ class PagedSSDCacheManager(CacheManager):
             "ssd_write_drops": 0,
             "ssd_inline_write_fallbacks": 0,
             # SSD write accounting (see ssd_cache_write_policy).
+            "ssd_block_bytes_written": 0,
+            "ssd_block_reads": 0,
+            "ssd_block_read_bytes": 0,
             "ssd_writes_skipped_orphan": 0,
             "ssd_writes_skipped_orphan_bytes": 0,
             "ssd_write_regret": 0,
             "ssd_write_regret_tokens": 0,
+            "gdn_sidecar_commits": 0,
+            "gdn_sidecar_commit_bytes": 0,
             "gdn_sidecars_dropped": 0,
         }
         policy = str(ssd_cache_write_policy).strip().lower()
@@ -2017,6 +2023,8 @@ class PagedSSDCacheManager(CacheManager):
             raise ValueError("ssd_cache_min_chain_tokens must be a positive integer")
         self._ssd_min_chain_tokens = ssd_cache_min_chain_tokens
         self._ssd_min_chain_fallback_warned = False
+        # reason -> {"count", "bytes"} for blocks queued to SSD.
+        self._ssd_write_profile: dict[str, dict[str, int]] = {}
         # Recently dropped (not written) block hashes -> token_count, to count
         # later lookups that wanted them ("regret"). Bounded, oldest first out.
         self._ssd_drop_ghosts: OrderedDict[bytes, int] = OrderedDict()
@@ -2043,6 +2051,9 @@ class PagedSSDCacheManager(CacheManager):
         # Maintained under _hot_cache_lock by _hot_link/_hot_unlink at every
         # insertion/removal; read lock-free by the eviction predicates.
         self._hot_children: dict[bytes, int] = {}
+        # Eviction profile for cache diagnostics: per entry category, how many
+        # entries/bytes left the hot tier and whether they were ever re-read.
+        self._evict_profile: dict[str, dict[str, float]] = {}
 
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
@@ -2150,6 +2161,169 @@ class PagedSSDCacheManager(CacheManager):
         if self._hot_cache_budget is not None:
             return self._hot_cache_budget.remaining_bytes
         return max(0, self._hot_cache_max_bytes - self._hot_cache_total_bytes)
+
+    @staticmethod
+    def _hot_entry_category(entry: dict) -> str:
+        """Classify a hot entry: ``tail``, ``hybrid_state`` or ``kv``.
+
+        ``hybrid_state`` means the block carries non-sliceable recurrent or
+        pooling state (ArraysCache etc.) next to, or instead of, plain KV.
+        """
+        meta = entry.get("block_metadata")
+        if meta is not None and getattr(meta, "tail_terminal", False):
+            return "tail"
+        types = entry.get("layer_cache_types") or []
+        if any(
+            t in _ARRAYS_SUB_CLASSES
+            or t in _POOLING_SUB_CLASSES
+            or t in _CACHELIST_NON_SLICEABLE_SUB_CLASSES
+            for t in types
+        ):
+            return "hybrid_state"
+        return "kv"
+
+    @staticmethod
+    def _hot_entry_bytes_by_layer_type(entry: dict) -> dict[str, int]:
+        """Attribute an entry's raw bytes to cache layer types via ``layer_N`` names."""
+        types = entry.get("layer_cache_types") or []
+        out: dict[str, int] = {}
+        for name, value in (entry.get("tensors_raw") or {}).items():
+            m = re.match(r"layer_(\d+)", name)
+            idx = int(m.group(1)) if m else -1
+            kind = types[idx] if 0 <= idx < len(types) else "unknown"
+            out[kind] = out.get(kind, 0) + len(value[0])
+        for name, arr in (entry.get("arrays") or {}).items():
+            m = re.match(r"layer_(\d+)", name)
+            idx = int(m.group(1)) if m else -1
+            kind = types[idx] if 0 <= idx < len(types) else "unknown"
+            out[kind] = out.get(kind, 0) + int(arr.nbytes)
+        return out
+
+    def _record_hot_eviction(self, entry: dict) -> None:
+        try:
+            cat = self._hot_entry_category(entry)
+            hits = int(entry.get("hits", 0))
+            age = time.time() - float(entry.get("created_at", time.time()))
+            size = self._hot_cache_entry_size(entry)
+            key = f"{cat}:{'reused' if hits else 'never_reused'}"
+            with self._hot_cache_lock:
+                p = self._evict_profile.setdefault(
+                    key, {"count": 0, "bytes": 0, "age_sum_s": 0.0, "hits": 0}
+                )
+                p["count"] += 1
+                p["bytes"] += size
+                p["age_sum_s"] += age
+                p["hits"] += hits
+        except Exception:
+            logger.debug("hot eviction profiling failed", exc_info=True)
+
+    def get_cache_breakdown(self, top_n: int = 10) -> dict[str, Any]:
+        """Diagnostic view of what occupies the hot tier and what gets evicted.
+
+        Reports, per category (kv / hybrid_state / tail) and per layer type,
+        entry counts, bytes and re-read counts, plus the largest entries and an
+        eviction profile (entries that left the tier never having been
+        re-read are the ones a smarter policy could have dropped earlier).
+        Read-only; safe to call from the admin thread.
+        """
+        now = time.time()
+        cats: dict[str, dict[str, float]] = {}
+        by_layer_type: dict[str, int] = {}
+        rows: list[dict[str, Any]] = []
+        with self._hot_cache_lock:
+            items = list(self._hot_cache.items())  # LRU order, oldest first
+            evict_profile = {k: dict(v) for k, v in self._evict_profile.items()}
+        for rank, (block_hash, entry) in enumerate(items):
+            if entry.get("staging"):
+                continue
+            size = self._hot_cache_entry_size(entry)
+            cat = self._hot_entry_category(entry)
+            hits = int(entry.get("hits", 0))
+            meta = entry.get("block_metadata")
+            c = cats.setdefault(
+                cat,
+                {"entries": 0, "bytes": 0, "tokens": 0, "never_reused": 0,
+                 "never_reused_bytes": 0, "dirty": 0, "hits": 0},
+            )
+            c["entries"] += 1
+            c["bytes"] += size
+            c["tokens"] += int(getattr(meta, "token_count", 0) or 0)
+            c["hits"] += hits
+            c["dirty"] += 1 if entry.get("dirty", True) else 0
+            if hits == 0:
+                c["never_reused"] += 1
+                c["never_reused_bytes"] += size
+            for kind, nbytes in self._hot_entry_bytes_by_layer_type(entry).items():
+                by_layer_type[kind] = by_layer_type.get(kind, 0) + nbytes
+            rows.append(
+                {
+                    "hash": block_hash.hex()[:16],
+                    "category": cat,
+                    "bytes": size,
+                    "tokens": int(getattr(meta, "token_count", 0) or 0),
+                    "hits": hits,
+                    "age_s": round(now - float(entry.get("created_at", now)), 1),
+                    "idle_s": round(
+                        now - float(entry.get("last_hit_at", entry.get("created_at", now))),
+                        1,
+                    ),
+                    "lru_rank": rank,  # 0 = next to be evicted
+                    "dirty": bool(entry.get("dirty", True)),
+                    "parent": (
+                        getattr(meta, "parent_hash", None).hex()[:16]
+                        if getattr(meta, "parent_hash", None)
+                        else None
+                    ),
+                }
+            )
+        rows.sort(key=lambda r: r["bytes"], reverse=True)
+        for k, v in evict_profile.items():
+            v["avg_age_s"] = round(v["age_sum_s"] / v["count"], 1) if v["count"] else 0.0
+            v.pop("age_sum_s", None)
+        return {
+            "hot_cache_entries": len(items),
+            "hot_cache_bytes": self._hot_cache_total_bytes,
+            "hot_cache_max_bytes": self._effective_hot_cache_max_bytes(),
+            "by_category": cats,
+            "bytes_by_layer_type": by_layer_type,
+            "largest_entries": rows[:top_n],
+            "eviction_profile": evict_profile,
+            "eviction_policy": (
+                self._hot_cache_budget.eviction_policy
+                if self._hot_cache_budget is not None
+                else self._hot_eviction_policy
+            ),
+            "admission_refusals": self._stats["hot_cache_admission_refusals"],
+            "hot_evictions_total": self._stats["hot_cache_evictions"],
+            "ssd": self.get_ssd_write_report(),
+        }
+
+    def reset_ssd_write_accounting(self) -> None:
+        """Zero SSD write/read counters (benchmarks)."""
+        for key in list(self._stats):
+            if key.startswith(("ssd_block_", "ssd_writes_skipped", "ssd_write_regret", "gdn_sidecar")):
+                self._stats[key] = 0
+        self._ssd_write_profile = {}
+        with self._hot_cache_lock:
+            self._ssd_drop_ghosts.clear()
+
+    def get_ssd_write_report(self) -> dict[str, Any]:
+        """SSD write/read accounting for diagnostics and benchmarks."""
+        keys = [
+            "ssd_block_bytes_written", "ssd_block_reads", "ssd_block_read_bytes",
+            "ssd_writes_skipped_orphan", "ssd_writes_skipped_orphan_bytes",
+            "ssd_writes_skipped_short", "ssd_writes_skipped_short_bytes",
+            "ssd_write_regret", "ssd_write_regret_tokens",
+            "gdn_sidecar_commits", "gdn_sidecar_commit_bytes", "gdn_sidecars_dropped",
+        ]
+        return {
+            "write_policy": self._ssd_write_policy,
+            "min_chain_tokens": self._ssd_min_chain_tokens,
+            "queued_by_reason": {k: dict(v) for k, v in self._ssd_write_profile.items()},
+            **{k: self._stats.get(k, 0) for k in keys},
+            "ssd_size_bytes": self._index.total_size if hasattr(self._index, "total_size") else None,
+            "gdn_sidecar_size_bytes": self._gdn_sidecar_index.total_size,
+        }
 
     # --- block lineage helpers (used by payload rewrites) -----------------
 
@@ -2343,7 +2517,7 @@ class PagedSSDCacheManager(CacheManager):
                 parent = self._hot_entry_parent(parent_entry)
                 seen += 1
 
-    def _persist_or_drop(self, block_hash: bytes, entry: dict, *, blocking: bool = False) -> bool:
+    def _persist_or_drop(self, block_hash: bytes, entry: dict, reason: str, *, blocking: bool = False) -> bool:
         """Write a dirty entry leaving the hot tier, or drop it per policy.
 
         Returns True if the entry was queued/written.
@@ -2362,7 +2536,9 @@ class PagedSSDCacheManager(CacheManager):
             self._remember_dropped(block_hash, entry)
             self._drop_gdn_sidecar(block_hash, entry)
             return False
-        written = self._enqueue_ssd_write(block_hash, entry, blocking=blocking)
+        written = self._enqueue_ssd_write(
+            block_hash, entry, blocking=blocking, reason=f"{reason}:{decision}"
+        )
         if written and self._ssd_write_policy == "min_chain_tokens":
             self._mark_parent_persist(entry)
         return written
@@ -2412,6 +2588,7 @@ class PagedSSDCacheManager(CacheManager):
 
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
+        self._record_hot_eviction(entry)
         if entry.get("staging"):
             return  # Its SSD write is already queued.
         if not entry.get("dirty", True):
@@ -2422,7 +2599,7 @@ class PagedSSDCacheManager(CacheManager):
             return
         if self._hot_cache_only:
             return  # Nothing is written to SSD in hot-cache-only mode.
-        self._persist_or_drop(block_hash, entry)
+        self._persist_or_drop(block_hash, entry, "evict")
 
     def _hot_cache_put(self, block_hash: bytes, entry: dict) -> None:
         """Add entry to hot cache, evicting LRU entries if capacity exceeded.
@@ -2431,6 +2608,8 @@ class PagedSSDCacheManager(CacheManager):
         """
         entry_size = self._hot_cache_entry_size(entry)
         evicted_entries: list = []
+        entry.setdefault("created_at", time.time())
+        entry.setdefault("hits", 0)
 
         if self._hot_cache_budget is not None:
             with self._hot_cache_lock:
@@ -2489,6 +2668,7 @@ class PagedSSDCacheManager(CacheManager):
         entry: dict,
         *,
         blocking: bool = False,
+        reason: str = "other",
     ) -> bool:
         """Enqueue a hot cache entry for SSD background write.
 
@@ -2528,6 +2708,11 @@ class PagedSSDCacheManager(CacheManager):
             self._incompatible_index.remove(block_hash)
             self._index.add(blk_meta)
 
+        queued_bytes = sum(len(raw) for raw, _, _ in tensors_raw.values())
+        profile = self._ssd_write_profile.setdefault(reason, {"count": 0, "bytes": 0})
+        profile["count"] += 1
+        profile["bytes"] += queued_bytes
+
         # 3. Queue third — enqueue for background writer.
         try:
             item = (block_hash, tensors_raw, metadata, file_path)
@@ -2563,6 +2748,8 @@ class PagedSSDCacheManager(CacheManager):
             if block_hash in self._hot_cache:
                 self._hot_cache.move_to_end(block_hash)
                 entry = self._hot_cache[block_hash]
+                entry["hits"] = entry.get("hits", 0) + 1
+                entry["last_hit_at"] = time.time()
             else:
                 return None
         if self._hot_cache_budget is not None:
@@ -3017,6 +3204,7 @@ class PagedSSDCacheManager(CacheManager):
 
         signature_digest = self._gdn_signature_digest(cache_signature)
         final_path = self._get_gdn_sidecar_path(source_block_hash, cache_signature)
+        staged_size = int(getattr(staged_stat, "st_size", 0) or 0)
         with self._lock:
             try:
                 sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
@@ -3070,6 +3258,8 @@ class PagedSSDCacheManager(CacheManager):
                             last_access=committed_at,
                         )
                     )
+                    self._stats["gdn_sidecar_commits"] += 1
+                    self._stats["gdn_sidecar_commit_bytes"] += staged_size
                     return final_path
                 except OSError:
                     if old is not None and self._is_safe_gdn_sidecar_file(
@@ -3688,6 +3878,8 @@ class PagedSSDCacheManager(CacheManager):
                 # before any cleanup so ``saves_persisted`` reflects rename
                 # success even if the post-rename eviction check below unlinks it.
                 self._stats["saves_persisted"] += 1
+                if isinstance(actual_size, int):
+                    self._stats["ssd_block_bytes_written"] += actual_size
                 with self._persistence_progress_lock:
                     self._persistence_last_success = time.monotonic()
                     self._persistence_failed = False
@@ -4009,7 +4201,7 @@ class PagedSSDCacheManager(CacheManager):
             # Pressure write-through for an already-dirty hot-cache entry:
             # use the same pending-buffer / SSD-writer path as hot-cache
             # eviction, then drop the long-lived hot-cache reference.
-            if self._enqueue_ssd_write(block_hash, hot_entry):
+            if self._enqueue_ssd_write(block_hash, hot_entry, reason="pressure"):
                 self._hot_cache_remove(block_hash)
                 self._stats["hits"] += 1
                 return True
@@ -4289,7 +4481,7 @@ class PagedSSDCacheManager(CacheManager):
                     # hot cache for RAM-speed reads; the background writer
                     # marks the retained entry clean once the file commits, so
                     # a later LRU eviction can simply drop it.
-                    self._enqueue_ssd_write(block_hash, cache_entry)
+                    self._enqueue_ssd_write(block_hash, cache_entry, reason="write_through")
                 self._stats["saves"] += 1
                 return True
 
@@ -4300,7 +4492,7 @@ class PagedSSDCacheManager(CacheManager):
             if self._hot_cache_enabled and not hot_cache_write_back:
                 # Pressure write-through: keep the dirty-block durability path
                 # but avoid retaining this block as a hot-cache entry.
-                ok = self._enqueue_ssd_write(block_hash, cache_entry)
+                ok = self._enqueue_ssd_write(block_hash, cache_entry, reason="pressure")
                 if ok:
                     self._stats["saves"] += 1
                     logger.debug(
@@ -4884,6 +5076,10 @@ class PagedSSDCacheManager(CacheManager):
             # Load directly on the inference thread (Metal-safe).
             # See load_block() for rationale on removing the executor.
             arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
+            self._stats["ssd_block_reads"] += 1
+            self._stats["ssd_block_read_bytes"] += int(
+                getattr(block_metadata, "file_size", 0) or 0
+            )
 
             # Defensive version check, mirrors load_block().
             if (
@@ -5645,7 +5841,7 @@ class PagedSSDCacheManager(CacheManager):
                 )
                 break
             if entry.get("dirty", True) and self._persist_or_drop(
-                block_hash, entry
+                block_hash, entry, "clear"
             ):
                 flushed += 1
         self._flush_set = set()
@@ -5952,9 +6148,11 @@ class PagedSSDCacheManager(CacheManager):
                 # payload. Only the dirty flag proves this entry is persisted.
                 decision = self._ssd_write_decision(block_hash, entry)
                 if decision in self._SSD_DROP_DECISIONS and not self._hot_cache_only:
-                    self._persist_or_drop(block_hash, entry)
+                    self._persist_or_drop(block_hash, entry, "shutdown")
                     continue
-                if self._enqueue_ssd_write(block_hash, entry, blocking=True):
+                if self._enqueue_ssd_write(
+                    block_hash, entry, blocking=True, reason=f"shutdown:{decision}"
+                ):
                     flushed += 1
                 else:
                     failed += 1

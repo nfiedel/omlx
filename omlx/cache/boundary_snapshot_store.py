@@ -188,6 +188,9 @@ class BoundarySnapshotSSDStore:
         self._pending_bytes = 0
         self._pending_peak_bytes = 0
         self._backpressure_ms = 0.0
+        # Staging files written to disk (SSD write accounting).
+        self._staged_files_written = 0
+        self._staged_bytes_written = 0
 
         # Cancelled requests with remaining queue item counts. Writer
         # thread decrements on each skip; entry is deleted when count
@@ -560,6 +563,21 @@ class BoundarySnapshotSSDStore:
     def pending_bytes(self) -> int:
         with self._pending_lock:
             return self._pending_bytes
+
+    def _count_staged_write(self, written: Any) -> None:
+        with self._pending_lock:
+            self._staged_files_written += 1
+            if isinstance(written, int):
+                self._staged_bytes_written += written
+
+    @property
+    def staged_write_stats(self) -> dict[str, int]:
+        """Staging files and bytes written to disk since startup."""
+        with self._pending_lock:
+            return {
+                "files": self._staged_files_written,
+                "bytes": self._staged_bytes_written,
+            }
 
     @property
     def pending_peak_bytes(self) -> int:
@@ -984,7 +1002,8 @@ class BoundarySnapshotSSDStore:
                         file_path,
                     )
                     return False
-                _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
+                written = _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
+                self._count_staged_write(written)
                 if self._is_cancelled(pw_key[0]):
                     with suppress(OSError):
                         temp_path.unlink()
@@ -1132,7 +1151,8 @@ class BoundarySnapshotSSDStore:
                     file_path,
                 )
                 return
-            _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
+            written = _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
+            self._count_staged_write(written)
 
             # Request may have been cleaned up while serializing.
             if self._is_cancelled(pw_key[0]):

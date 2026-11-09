@@ -145,6 +145,9 @@ class TestOverCapacityChain:
             _put(mgr, key, parent)
         assert list(mgr._hot_cache) == [b"A0", b"A1", b"A2", b"A3"]
         assert mgr._stats["hot_cache_admission_refusals"] == 6
+        report = mgr.get_cache_breakdown()
+        assert report["eviction_policy"] == "chain_aware_lru"
+        assert report["admission_refusals"] == 6
 
     def test_lru_keeps_lone_oversized_entry(self, tmp_path, budget):
         mgr = _manager(tmp_path, "lru", cap_entries=1, budget=budget)

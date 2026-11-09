@@ -7612,6 +7612,191 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     }
 
 
+@router.get("/api/cache-breakdown")
+async def get_cache_breakdown(
+    top_n: int = 10, is_admin: bool = Depends(require_admin)
+):
+    """Per-model hot-tier diagnostics: what occupies the cache and what is evicted.
+
+    Reports entry categories (kv / hybrid_state / tail), bytes by layer type,
+    the largest entries with hit counts and LRU rank, and an eviction profile
+    separating entries that were re-read from those that never were.
+    """
+    top_n = max(1, min(int(top_n), 100))
+    models = {}
+    for model_id, scheduler, _core in _iter_loaded_scheduler_records():
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd_manager is None or not hasattr(ssd_manager, "get_cache_breakdown"):
+            continue
+        try:
+            models[model_id] = ssd_manager.get_cache_breakdown(top_n=top_n)
+        except Exception as exc:
+            logger.warning("cache breakdown failed for '%s': %s", model_id, exc)
+            models[model_id] = {"error": str(exc)}
+    return {"models": models}
+
+
+class CacheExperimentRequest(BaseModel):
+    """Dev-only: live hot-cache settings for benchmark runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hot_cache_max_size: str | None = None  # e.g. "2GB"; must be > 0
+    hot_cache_eviction_policy: str | None = None  # "lru" | "chain_aware_lru"
+    gdn_snapshot_interval: int | None = None  # positive int
+    gdn_staging_ram_budget: str | None = None  # "30%" of hot cache, or "1GB"; "0" = stage to SSD
+    ssd_cache_write_policy: str | None = None  # "all" | "min_chain_tokens"
+    ssd_cache_min_chain_tokens: int | None = None  # positive int
+    reset: bool = True  # clear prefix state + hot tier (required for any change)
+    label: str | None = None  # benchmark run name, echoed to the server log
+    idle_timeout_s: float = 30.0
+
+
+def _require_cache_experiments() -> None:
+    from .cache_experiment import ENV_FLAG, experiments_enabled
+
+    if not experiments_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Cache experiments are disabled (set {ENV_FLAG}=1).",
+        )
+
+
+@router.get("/api/cache-experiment")
+async def get_cache_experiment(is_admin: bool = Depends(require_admin)):
+    """Dev-only: report the live hot-cache settings of loaded models."""
+    from .cache_experiment import current_settings
+
+    _require_cache_experiments()
+    pool = _get_engine_pool()
+    return current_settings(pool, list(_iter_loaded_schedulers()))
+
+
+@router.post("/api/cache-experiment")
+async def post_cache_experiment(
+    request: CacheExperimentRequest, is_admin: bool = Depends(require_admin)
+):
+    """Dev-only: reset all prefix-cache state and apply hot-cache settings live.
+
+    Unlike the cache-settings path, this keeps models loaded. Refuses (409)
+    while any request or async cache store is in flight.
+    """
+    from .cache_experiment import (
+        apply_gdn_staging_ram_budget,
+        apply_gdn_snapshot_interval,
+        apply_ssd_cache_write_policy,
+        apply_hot_cache_eviction_policy,
+        apply_hot_cache_max_bytes,
+        current_settings,
+        reset_prefix_state,
+        wait_until_idle,
+    )
+
+    _require_cache_experiments()
+    max_bytes = None
+    if request.hot_cache_max_size is not None:
+        try:
+            max_bytes = _parse_hot_cache_max_size(request.hot_cache_max_size)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if max_bytes <= 0:
+            raise HTTPException(
+                status_code=400, detail="hot_cache_max_size must be > 0"
+            )
+    policy = None
+    if request.hot_cache_eviction_policy is not None:
+        from ..settings import VALID_HOT_CACHE_EVICTION_POLICIES
+
+        policy = request.hot_cache_eviction_policy.strip().lower()
+        if policy not in VALID_HOT_CACHE_EVICTION_POLICIES:
+            raise HTTPException(
+                status_code=400,
+                detail="hot_cache_eviction_policy must be one of: "
+                + ", ".join(VALID_HOT_CACHE_EVICTION_POLICIES),
+            )
+    interval = request.gdn_snapshot_interval
+    if interval is not None:
+        from ..settings import is_valid_gdn_snapshot_interval
+
+        if not is_valid_gdn_snapshot_interval(interval):
+            raise HTTPException(
+                status_code=400,
+                detail="gdn_snapshot_interval must be a positive integer",
+            )
+    staging_budget = None
+    if request.gdn_staging_ram_budget is not None:
+        from ..settings import parse_gdn_staging_ram_budget
+
+        try:
+            staging_budget = parse_gdn_staging_ram_budget(request.gdn_staging_ram_budget)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid gdn_staging_ram_budget: {exc}") from exc
+    write_policy = None
+    if request.ssd_cache_write_policy is not None:
+        from ..settings import VALID_SSD_CACHE_WRITE_POLICIES
+
+        write_policy = request.ssd_cache_write_policy.strip().lower()
+        if write_policy not in VALID_SSD_CACHE_WRITE_POLICIES:
+            raise HTTPException(
+                status_code=400,
+                detail="ssd_cache_write_policy must be one of: "
+                + ", ".join(VALID_SSD_CACHE_WRITE_POLICIES),
+            )
+    min_chain = request.ssd_cache_min_chain_tokens
+    if min_chain is not None:
+        from ..settings import is_valid_gdn_snapshot_interval
+
+        if not is_valid_gdn_snapshot_interval(min_chain):
+            raise HTTPException(
+                status_code=400, detail="ssd_cache_min_chain_tokens must be a positive integer"
+            )
+    if (
+        max_bytes is not None or policy is not None or interval is not None
+        or write_policy is not None
+        or staging_budget is not None or min_chain is not None
+    ) and not request.reset:
+        raise HTTPException(
+            status_code=400,
+            detail="changing cache experiment settings requires reset=true",
+        )
+
+    schedulers = list(_iter_loaded_schedulers())
+    busy = await asyncio.to_thread(
+        wait_until_idle, schedulers, max(0.0, request.idle_timeout_s)
+    )
+    if busy:
+        raise HTTPException(status_code=409, detail={"busy": busy})
+
+    cleared = {}
+    if request.reset:
+        for model_id, scheduler in schedulers:
+            cleared[model_id] = reset_prefix_state(scheduler)
+    pool = _get_engine_pool()
+    if max_bytes is not None:
+        apply_hot_cache_max_bytes(pool, schedulers, max_bytes)
+    if policy is not None:
+        apply_hot_cache_eviction_policy(pool, schedulers, policy)
+    if interval is not None:
+        apply_gdn_snapshot_interval(pool, schedulers, interval)
+    if write_policy is not None or min_chain is not None:
+        apply_ssd_cache_write_policy(pool, schedulers, write_policy, min_chain)
+    if staging_budget is not None:
+        apply_gdn_staging_ram_budget(pool, schedulers, staging_budget)
+    if request.reset:
+        # Release MLX buffers through the scheduler-synchronized clear path.
+        await clear_hot_cache(is_admin=True)
+    logger.info(
+        "Cache experiment applied [%s]: reset=%s hot_cache_max_size=%s "
+        "hot_cache_eviction_policy=%s gdn_snapshot_interval=%s",
+        request.label or "-",
+        request.reset,
+        request.hot_cache_max_size,
+        policy,
+        interval,
+    )
+    return {"cleared": cleared, "settings": current_settings(pool, schedulers)}
+
+
 @router.post("/api/hot-cache/clear")
 async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
     """Clear the in-memory hot cache and release the buffers it held.

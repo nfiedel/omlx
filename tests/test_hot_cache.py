@@ -202,6 +202,32 @@ class TestHotCacheEnabled:
         assert len(mgr._hot_cache) == 0
         assert mgr._hot_cache_total_bytes == 0
 
+    def test_cache_breakdown_tracks_hits_and_evictions(self, manager):
+        """get_cache_breakdown reports categories, hits and eviction profile."""
+        data = self._make_cache_data()
+        for i in range(3):
+            assert manager.save_block(
+                block_hash=f"bd{i}".encode(),
+                cache_data=data,
+                token_count=32,
+                model_name="test-model",
+                layer_cache_types=["KVCache"] * 4,
+            )
+        assert manager.load_block(b"bd1") is not None  # one re-read
+
+        report = manager.get_cache_breakdown(top_n=2)
+        kv = report["by_category"]["kv"]
+        assert kv["entries"] == 3
+        assert kv["never_reused"] == 2
+        assert kv["hits"] == 1
+        assert report["bytes_by_layer_type"]["KVCache"] > 0
+        assert len(report["largest_entries"]) == 2
+
+        # Evicting the re-read entry lands in the 'reused' bucket.
+        entry = manager._hot_cache_remove(b"bd1")
+        manager._handle_hot_cache_eviction(b"bd1", entry)
+        profile = manager.get_cache_breakdown()["eviction_profile"]
+        assert profile["kv:reused"]["count"] == 1
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheLRU:
