@@ -378,6 +378,30 @@ class SchedulerSettings:
         )
 
 
+DEFAULT_GDN_STAGING_RAM_BUDGET = "30%"
+
+
+def parse_gdn_staging_ram_budget(value: str) -> tuple[int, float]:
+    """Parse gdn_staging_ram_budget into (bytes, fraction of the hot cache).
+
+    "30%" -> (0, 0.30); "1GB" -> (1073741824, 0.0); "0" -> (0, 0.0) = off.
+    Raises ValueError for anything else.
+    """
+    text = str(value).strip()
+    if text.endswith("%"):
+        try:
+            pct = float(text[:-1])
+        except ValueError:
+            raise ValueError(f"not a percentage: {value!r}") from None
+        if not 0 <= pct <= 100:
+            raise ValueError("percentage must be between 0% and 100%")
+        return 0, pct / 100.0
+    nbytes = parse_size(text)
+    if nbytes < 0:
+        raise ValueError("must be non-negative")
+    return nbytes, 0.0
+
+
 @dataclass
 class CacheSettings:
     """Cache configuration settings."""
@@ -411,6 +435,12 @@ class CacheSettings:
     # N-th prefill boundary, plus the prompt's final one, is captured).
     # 1 = every block (historical behavior). Must be a positive integer.
     gdn_snapshot_interval: int = 1
+    # Embedded GDN layout with the SSD tier on: keep in-flight prefill
+    # boundary snapshots (all requests together) in RAM up to this budget
+    # instead of staging them to SSD; beyond it they spill to SSD. Either a
+    # percentage of the hot cache size ("30%") or a size ("1GB").
+    # "0" = always stage to SSD (historical).
+    gdn_staging_ram_budget: str = DEFAULT_GDN_STAGING_RAM_BUDGET
     # Runtime-only: the configured dir that GlobalSettings.ensure_directories()
     # could not create, e.g. on a disconnected external drive.
     unavailable_ssd_cache_dir: Path | None = field(
@@ -509,6 +539,7 @@ class CacheSettings:
             # precision is retained only after an explicit new-key selection.
             "gdn_sidecar_precision": self.gdn_sidecar_state_dtype,
             "gdn_snapshot_interval": self.gdn_snapshot_interval,
+            "gdn_staging_ram_budget": self.gdn_staging_ram_budget,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -560,6 +591,7 @@ class CacheSettings:
             ).lower(),
             # Kept as-is (no coercion) so validate() can reject non-integers.
             gdn_snapshot_interval=data.get("gdn_snapshot_interval", 1),
+            gdn_staging_ram_budget=str(data.get("gdn_staging_ram_budget", DEFAULT_GDN_STAGING_RAM_BUDGET)),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
@@ -1872,6 +1904,10 @@ class GlobalSettings:
 
         if not is_valid_gdn_snapshot_interval(self.cache.gdn_snapshot_interval):
             errors.append("gdn_snapshot_interval must be a positive integer")
+        try:
+            parse_gdn_staging_ram_budget(self.cache.gdn_staging_ram_budget)
+        except ValueError as e:
+            errors.append(f"Invalid gdn_staging_ram_budget: {e}")
 
         if self.cache.hot_cache_eviction_policy not in VALID_HOT_CACHE_EVICTION_POLICIES:
             errors.append(
@@ -2013,6 +2049,7 @@ class GlobalSettings:
             else None
         )
 
+        staging_bytes, staging_fraction = parse_gdn_staging_ram_budget(self.cache.gdn_staging_ram_budget)
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
@@ -2031,6 +2068,8 @@ class GlobalSettings:
             hot_cache_write_through=self.cache.hot_cache_write_through,
             hot_cache_eviction_policy=self.cache.hot_cache_eviction_policy,
             gdn_snapshot_interval=self.cache.gdn_snapshot_interval,
+            gdn_staging_ram_budget_bytes=staging_bytes,
+            gdn_staging_ram_budget_fraction=staging_fraction,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size

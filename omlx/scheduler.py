@@ -144,6 +144,21 @@ def _token_bytes(detokenizer: Any, tokenizer: Any, token_id: int) -> bytes:
     return tokenizer.decode([token_id]).encode()
 
 
+def _tree_nbytes(value: Any) -> int:
+    """Total bytes of MLX arrays in a (nested) snapshot value."""
+    total = 0
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, mx.array):
+            total += int(item.nbytes)
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return total
+
+
 def _compact_boundary_snapshot_value(
     value: Any, token_count: int, block_size: int, stream: Any
 ) -> Any:
@@ -1975,6 +1990,13 @@ class SchedulerConfig:
     # Real GDN state every N-th block (+ tips), embedded or sidecar layout;
     # see settings.CacheSettings.
     gdn_snapshot_interval: int = 1
+    # Embedded layout + SSD tier: RAM for in-flight prefill boundary
+    # snapshots (all requests together) before spilling to SSD staging
+    # (0 = always stage to SSD).
+    gdn_staging_ram_budget_bytes: int = 0
+    # When > 0, the budget is this fraction of the hot cache size instead
+    # (settings "30%"); takes precedence over gdn_staging_ram_budget_bytes.
+    gdn_staging_ram_budget_fraction: float = 0.3
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     paged_ssd_cache_auto_size: bool = False
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
@@ -2574,6 +2596,10 @@ class Scheduler:
         # Prefill boundaries not captured because they are off the snapshot
         # grid (gdn_snapshot_interval).
         self._sidecar_boundaries_skipped = 0
+        # RAM-first staging (embedded layout): snapshots kept in RAM vs spilled.
+        self._staging_ram_kept = 0
+        self._staging_ram_kept_bytes = 0
+        self._staging_spilled = 0
         # Lazy detection flag: True/False once determined, None before first check.
         self._boundary_snapshot_required: bool | None = None
         # SSD store for offloading boundary snapshots (initialized in _init_tiered_cache).
@@ -9043,6 +9069,28 @@ class Scheduler:
         final_boundary = (prompt_tokens // block_size) * block_size
         return prompt_tokens <= 0 or token_count >= final_boundary
 
+    def _staging_ram_budget_bytes(self) -> int:
+        """RAM budget for in-flight prefill snapshots, shared by all requests.
+
+        A fraction of the hot cache size when configured as a percentage
+        (0 without a hot cache), otherwise the configured size.
+        """
+        fraction = float(getattr(self.config, "gdn_staging_ram_budget_fraction", 0.0) or 0.0)
+        if fraction > 0:
+            mgr = getattr(self, "paged_ssd_cache_manager", None)
+            effective = getattr(mgr, "_effective_hot_cache_max_bytes", None)
+            hot_max = int(effective()) if callable(effective) else 0
+            return int(hot_max * fraction)
+        return int(getattr(self.config, "gdn_staging_ram_budget_bytes", 0) or 0)
+
+    def _ram_first_staging_active(self) -> bool:
+        """RAM-first staging applies to the embedded layout with SSD staging on."""
+        if self._boundary_snapshot_store is None:
+            return False
+        if self._staging_ram_budget_bytes() <= 0:
+            return False
+        return not self._gdn_split_active()
+
     def _gdn_split_active(self) -> bool:
         """Return whether the current cache layout can use GDN sidecars."""
         if not getattr(self.config, "gdn_ssd_split_enabled", False):
@@ -9172,10 +9220,39 @@ class Scheduler:
 
         snapshot_block_size = snapshot_block_size or block_size
 
+        # RAM-first staging (embedded layout with the SSD tier on): keep the
+        # snapshot in memory while all in-flight requests' in-memory snapshots
+        # fit the budget, so nothing reaches SSD unless the block later leaves RAM.
+        ram_value = None
+        if self._ram_first_staging_active():
+            ram_value = _compact_boundary_snapshot_value(
+                self._prefill_snapshot_value(snapshot_cache),
+                token_count,
+                snapshot_block_size,
+                self._stream,
+            )
+            nbytes = _tree_nbytes(ram_value)
+            in_use = sum(
+                _tree_nbytes(v)
+                for snaps in self._boundary_cache_snapshots.values()
+                for v in snaps.values()
+                if v is not None
+            )
+            budget = self._staging_ram_budget_bytes()
+            if in_use + nbytes <= budget:
+                self._staging_ram_kept += 1
+                self._staging_ram_kept_bytes += nbytes
+            else:
+                self._staging_spilled += 1
+                ram_value = None
+
+        if ram_value is not None:
+            self._boundary_cache_snapshots[request_id][token_count] = ram_value
+            storage = "memory"
         # Offload snapshot to SSD if store is available, keeping only a
         # None marker in the dict.  Falls back to in-memory storage when
         # the SSD store is unavailable or the write fails.
-        if self._boundary_snapshot_store is not None:
+        elif self._boundary_snapshot_store is not None:
             # Keep the extraction + serialization eval on the per-engine
             # stream, mirroring _eval_snapshot_cache on the in-memory path
             # below. save() slices the live cache state and mx.eval's it on

@@ -495,6 +495,7 @@ class TestCacheSettings:
             "gdn_ssd_pending_max_size": "512MB",
             "gdn_sidecar_precision": "fp32",
             "gdn_snapshot_interval": 1,
+            "gdn_staging_ram_budget": "30%",
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
