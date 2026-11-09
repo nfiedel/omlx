@@ -1972,6 +1972,9 @@ class SchedulerConfig:
     hot_cache_write_through: bool = False
     # "lru" or "chain_aware_lru" (see settings.VALID_HOT_CACHE_EVICTION_POLICIES)
     hot_cache_eviction_policy: str = "lru"
+    # Real GDN state every N-th block (+ tips), embedded or sidecar layout;
+    # see settings.CacheSettings.
+    gdn_snapshot_interval: int = 1
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     paged_ssd_cache_auto_size: bool = False
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
@@ -2568,6 +2571,9 @@ class Scheduler:
         # Multiple snapshots per request to support per-block ArraysCache state storage.
         # Values are None when offloaded to SSD via _boundary_snapshot_store.
         self._boundary_cache_snapshots: dict[str, dict[int, Any]] = {}
+        # Prefill boundaries not captured because they are off the snapshot
+        # grid (gdn_snapshot_interval).
+        self._sidecar_boundaries_skipped = 0
         # Lazy detection flag: True/False once determined, None before first check.
         self._boundary_snapshot_required: bool | None = None
         # SSD store for offloading boundary snapshots (initialized in _init_tiered_cache).
@@ -2622,6 +2628,7 @@ class Scheduler:
                 model=model,
                 paged_cache_manager=self.paged_cache_manager,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
+                gdn_snapshot_interval=self.config.gdn_snapshot_interval,
             )
 
             # Initialize paged SSD cache. If the backing directory is not
@@ -8982,6 +8989,60 @@ class Scheduler:
             for layer_cache in cache_list
         )
 
+    def _boundary_grid_interval(self) -> int:
+        """Snapshot grid interval for prefill captures in the active layout.
+
+        gdn_snapshot_interval in the sidecar layout; in the embedded layout,
+        only when the prefix cache would thin it (ArraysCache-family recurrent
+        state only). Otherwise 1.
+        """
+        prefix_cache = self.block_aware_cache
+        interval = int(getattr(prefix_cache, "_gdn_snapshot_interval", 1) or 1)
+        if self._gdn_split_active():
+            return interval
+        if interval <= 1 or prefix_cache is None:
+            return 1
+        layer_types = getattr(
+            getattr(self, "paged_ssd_cache_manager", None),
+            "_expected_layer_cache_types",
+            None,
+        )
+        applies = getattr(prefix_cache, "_snapshot_thinning_applies", None)
+        if not layer_types or not callable(applies):
+            return 1
+        try:
+            ok = applies(
+                list(layer_types),
+                split_gdn_layout=False,
+                pm_layers_present=False,
+                require_contiguous_pooling_snapshots=False,
+            )
+        except Exception:
+            ok = False
+        return interval if ok else 1
+
+    def _sidecar_boundary_needed(
+        self, request_id: str, token_count: int, block_size: int
+    ) -> bool:
+        """Whether a prefill boundary snapshot must be captured.
+
+        With a snapshot grid interval N > 1 (sidecar or embedded layout),
+        only boundaries on the N-block grid (absolute position) and the
+        prompt's final full-block boundary are captured; the store keeps real
+        recurrent state only there and at its last block (tails are always
+        captured by their own path), so other snapshots would be staged and
+        never used.
+        """
+        interval = self._boundary_grid_interval()
+        if interval <= 1 or block_size <= 0:
+            return True
+        if token_count % (interval * block_size) == 0:
+            return True
+        request = self.requests.get(request_id)
+        prompt_tokens = int(getattr(request, "num_prompt_tokens", 0) or 0)
+        final_boundary = (prompt_tokens // block_size) * block_size
+        return prompt_tokens <= 0 or token_count >= final_boundary
+
     def _gdn_split_active(self) -> bool:
         """Return whether the current cache layout can use GDN sidecars."""
         if not getattr(self.config, "gdn_ssd_split_enabled", False):
@@ -9073,6 +9134,20 @@ class Scheduler:
             self._boundary_snapshot_diagnostics.record(
                 "capture_skipped",
                 reason="no_stateful_cache",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source=source,
+            )
+            return
+
+        if source != _TAIL_SNAPSHOT_SOURCE and not self._sidecar_boundary_needed(
+            request_id, token_count, block_size
+        ):
+            self._sidecar_boundaries_skipped += 1
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="off_sidecar_grid",
                 request_id=request_id,
                 token_count=token_count,
                 block_size=block_size,

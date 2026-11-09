@@ -404,6 +404,13 @@ class CacheSettings:
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
     gdn_sidecar_state_dtype: str = "fp32"
+    # Keep real recurrent (GDN) state only in every N-th full block of a
+    # cached chain, plus each chain's tip; other blocks store KV only and
+    # restores walk back to the nearest real-state block. Applies to the
+    # active GDN layout: embedded snapshots, or SSD sidecars (only every
+    # N-th prefill boundary, plus the prompt's final one, is captured).
+    # 1 = every block (historical behavior). Must be a positive integer.
+    gdn_snapshot_interval: int = 1
     # Runtime-only: the configured dir that GlobalSettings.ensure_directories()
     # could not create, e.g. on a disconnected external drive.
     unavailable_ssd_cache_dir: Path | None = field(
@@ -501,6 +508,7 @@ class CacheSettings:
             # every existing install to the exact fp32 default; reduced
             # precision is retained only after an explicit new-key selection.
             "gdn_sidecar_precision": self.gdn_sidecar_state_dtype,
+            "gdn_snapshot_interval": self.gdn_snapshot_interval,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -550,6 +558,8 @@ class CacheSettings:
             gdn_sidecar_state_dtype=str(
                 data.get("gdn_sidecar_precision", "fp32")
             ).lower(),
+            # Kept as-is (no coercion) so validate() can reject non-integers.
+            gdn_snapshot_interval=data.get("gdn_snapshot_interval", 1),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
@@ -571,6 +581,11 @@ class CacheSettings:
 # block when nothing else can be evicted, so a cached chain is never broken in
 # the middle.
 VALID_HOT_CACHE_EVICTION_POLICIES: tuple[str, ...] = ("lru", "chain_aware_lru")
+
+
+def is_valid_gdn_snapshot_interval(value: Any) -> bool:
+    """gdn_snapshot_interval must be a positive int (bool and floats rejected)."""
+    return type(value) is int and value >= 1
 
 
 MemoryGuardTier = Literal["safe", "balanced", "aggressive", "custom"]
@@ -1855,6 +1870,9 @@ class GlobalSettings:
                 "auto, ssd_sidecar, embedded"
             )
 
+        if not is_valid_gdn_snapshot_interval(self.cache.gdn_snapshot_interval):
+            errors.append("gdn_snapshot_interval must be a positive integer")
+
         if self.cache.hot_cache_eviction_policy not in VALID_HOT_CACHE_EVICTION_POLICIES:
             errors.append(
                 "hot_cache_eviction_policy must be one of: "
@@ -2012,6 +2030,7 @@ class GlobalSettings:
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
             hot_cache_eviction_policy=self.cache.hot_cache_eviction_policy,
+            gdn_snapshot_interval=self.cache.gdn_snapshot_interval,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size

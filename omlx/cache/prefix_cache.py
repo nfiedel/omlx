@@ -280,6 +280,7 @@ class BlockAwarePrefixCache(CacheManager):
         paged_cache_manager: PagedCacheManager,
         paged_ssd_cache_manager: PagedSSDCacheManager | None = None,
         gdn_ssd_split_enabled: bool = False,
+        gdn_snapshot_interval: int = 1,
     ):
         """
         Initialize block-aware prefix cache.
@@ -288,7 +289,25 @@ class BlockAwarePrefixCache(CacheManager):
             model: The MLX model (used for identification)
             paged_cache_manager: The PagedCacheManager instance for block management
             paged_ssd_cache_manager: The PagedSSDCacheManager for SSD storage (required for paged SSD-only mode)
+            gdn_snapshot_interval: Keep real recurrent state only in every
+                N-th full block (absolute block index) plus each store's last
+                block; other new blocks store KV only. 1 (default) keeps
+                every snapshot. Embedded layout: off-grid blocks get
+                placeholder recurrent state (only when every non-sliceable
+                layer is ArraysCache-family). SSD GDN sidecar layout: off-grid
+                interior blocks are stored without a sidecar. Restores walk
+                back to the newest block with real state.
         """
+        if type(gdn_snapshot_interval) is not int or gdn_snapshot_interval < 1:
+            raise ValueError(
+                "gdn_snapshot_interval must be a positive integer "
+                f"(got {gdn_snapshot_interval!r})"
+            )
+        self._gdn_snapshot_interval = gdn_snapshot_interval
+        # Blocks stored without a sidecar because of the sidecar interval.
+        self._gdn_sidecars_thinned = 0
+        # Boundary snapshots dropped by gdn_snapshot_interval (observability).
+        self._gdn_snapshots_thinned = 0
         self.model = model
         self.model_key = id(model)
         self.paged_cache = paged_cache_manager
@@ -1187,6 +1206,14 @@ class BlockAwarePrefixCache(CacheManager):
                     # A full snapshot can follow an indivisible image prefix.
                     snapshot_base_tokens = first_boundary
 
+        thin_snapshots = self._snapshot_thinning_applies(
+            layer_cache_types,
+            split_gdn_layout=split_gdn_layout,
+            pm_layers_present=pm_layers_present,
+            require_contiguous_pooling_snapshots=require_contiguous_pooling_snapshots,
+        )
+        thinned_snapshots = 0
+
         # Supersede-on-extend tracking (rotating models only, see below).
         first_new_block_idx: int | None = None
         tip_block_saved = False
@@ -1319,8 +1346,12 @@ class BlockAwarePrefixCache(CacheManager):
                         ),
                     )
                 if existing_block:
-                    if split_gdn_layout and not self._has_split_gdn_checkpoint(
-                        existing_block.block_hash, layer_cache_types
+                    if (
+                        split_gdn_layout
+                        and self._keeps_sidecar_snapshot(global_end, is_last_block)
+                        and not self._has_split_gdn_checkpoint(
+                            existing_block.block_hash, layer_cache_types
+                        )
                     ):
                         checkpoint_committed = self._commit_split_gdn_checkpoint(
                             boundary_snapshots,
@@ -1353,6 +1384,12 @@ class BlockAwarePrefixCache(CacheManager):
                         and HAS_MLX
                         and self.paged_ssd_cache is not None
                         and has_boundary_snapshot
+                        and not (
+                            thin_snapshots
+                            and not self._keeps_recurrent_snapshot(
+                                global_end, is_last_block
+                            )
+                        )
                         and existing_block.block_hash is not None
                         and existing_block.block_hash
                         not in self._backfill_checked_hashes
@@ -1471,7 +1508,16 @@ class BlockAwarePrefixCache(CacheManager):
                     and boundary_snapshots
                     and block_boundary_tc in boundary_snapshots
                 ):
-                    snapshot_cache_data = boundary_snapshots[block_boundary_tc]
+                    if thin_snapshots and not self._keeps_recurrent_snapshot(
+                        block_boundary_tc, is_last_block
+                    ):
+                        # Off-grid interior block: store KV with placeholder
+                        # recurrent state (live KV slices still cover it;
+                        # the continuity check below enforces that).
+                        thinned_snapshots += 1
+                        self._gdn_snapshots_thinned += 1
+                    else:
+                        snapshot_cache_data = boundary_snapshots[block_boundary_tc]
 
                 # True (not just "last") for the last block only when
                 # nothing beyond it was skipped: exact-terminal mode
@@ -1602,6 +1648,13 @@ class BlockAwarePrefixCache(CacheManager):
                                         layer_meta_states,
                                     )
                                 )
+                            elif not self._keeps_sidecar_snapshot(
+                                block_boundary_tc, is_last_block
+                            ):
+                                # Off-grid interior block: KV only, no
+                                # sidecar; restores walk back past it.
+                                checkpoint_committed = True
+                                self._gdn_sidecars_thinned += 1
                             else:
                                 checkpoint_committed = (
                                     self._commit_split_gdn_checkpoint(
@@ -2193,6 +2246,56 @@ class BlockAwarePrefixCache(CacheManager):
                 )
         self._tail_hashes.discard(block_hash)
         return True
+
+    def _snapshot_thinning_applies(
+        self,
+        layer_cache_types: list[str] | None,
+        *,
+        split_gdn_layout: bool,
+        pm_layers_present: bool,
+        require_contiguous_pooling_snapshots: bool,
+    ) -> bool:
+        """Whether gdn_snapshot_interval may drop snapshots for this store.
+
+        Only for layouts where every non-sliceable layer is ArraysCache-family
+        state embedded in the block. Pooling chains and per-member CacheList
+        layers need every boundary snapshot, rotating layers have their own
+        tip-strip lifecycle, and the split-GDN sidecar layout commits
+        checkpoints through a separate path.
+        """
+        if self._gdn_snapshot_interval <= 1 or not layer_cache_types:
+            return False
+        if split_gdn_layout or pm_layers_present or require_contiguous_pooling_snapshots:
+            return False
+        has_arrays = False
+        for type_name in layer_cache_types:
+            handler = CacheTypeRegistry.get_handler_by_class_name(type_name)
+            if handler.supports_block_slicing:
+                continue
+            if not CacheTypeRegistry.is_arrays_family(type_name):
+                return False
+            has_arrays = True
+        return has_arrays
+
+    def _keeps_sidecar_snapshot(self, block_end_tokens: int, is_last_block: bool) -> bool:
+        """Sidecar-layout counterpart of _keeps_recurrent_snapshot."""
+        n = self._gdn_snapshot_interval
+        if n <= 1 or is_last_block:
+            return True
+        return block_end_tokens % (n * self.block_size) == 0
+
+    def _keeps_recurrent_snapshot(self, block_end_tokens: int, is_last_block: bool) -> bool:
+        """Whether the full block ending at ``block_end_tokens`` keeps real state.
+
+        True for each store's last block (the chain tip) and for every block
+        whose absolute index is a multiple of gdn_snapshot_interval: block i
+        (0-based) ending at (i + 1) * block_size keeps state when
+        (i + 1) % N == 0. The single place that decides snapshot retention.
+        """
+        n = self._gdn_snapshot_interval
+        if n <= 1 or is_last_block:
+            return True
+        return block_end_tokens % (n * self.block_size) == 0
 
     def _strip_rotating_payload(
         self, block_hash: bytes, hot_cache_write_back: bool = True
@@ -5687,6 +5790,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._tail_block_hits = 0
         self._gdn_checkpoint_loads = 0
         self._gdn_checkpoint_walkbacks = 0
+        self._gdn_snapshots_thinned = 0
+        self._gdn_sidecars_thinned = 0
         self._last_gdn_restore = None
         self.paged_cache.reset_stats()
 
